@@ -45,6 +45,8 @@ OVERLAP_SECONDS = 300
 # ---------------------------------------------------------------------------------
 # Shared with intercom_history_sync.py - keep both copies identical.
 # ---------------------------------------------------------------------------------
+# US workspaces: api.intercom.io. EU: api.eu.intercom.io. Australia: api.au.intercom.io.
+# A token from one region gets 401 Unauthorized on the others.
 API = "https://api.intercom.io"
 INTERCOM_VERSION = "2.16"
 WORKERS = 8
@@ -66,11 +68,12 @@ def _find_token():
     """The Intercom token: a Hex secret / variable named INTERCOM_TOKEN (any case), or an
     environment variable of the same name. Fails loudly instead of silently doing nothing."""
     import os
-    for name, value in list(globals().items()):
-        if name.upper() == "INTERCOM_TOKEN" and isinstance(value, str) and value.strip():
-            return value.strip()
-    if os.environ.get("INTERCOM_TOKEN", "").strip():
-        return os.environ["INTERCOM_TOKEN"].strip()
+    candidates = [v for k, v in list(globals().items()) if k.upper() == "INTERCOM_TOKEN"]
+    candidates.append(os.environ.get("INTERCOM_TOKEN"))
+    for value in candidates:
+        if isinstance(value, str) and value.strip():
+            # Tokens copied from an n8n header credential often include the scheme; we add it.
+            return re.sub(r"^\s*Bearer\s+", "", value.strip().strip("'\""), flags=re.I)
     raise RuntimeError(
         "No Intercom token found. In Hex: Settings > Secrets > add a secret named "
         "INTERCOM_TOKEN, then rerun this cell."
@@ -95,7 +98,16 @@ def _request(method, path, **kwargs):
         if r.status_code >= 500:
             time.sleep(2 ** attempt)
             continue
-        r.raise_for_status()
+        if r.status_code >= 400:
+            hint = ""
+            if r.status_code == 401:
+                hint = (" -> Intercom rejected the token. Check it is the app's Access Token, "
+                        "without quotes or 'Bearer ', from the same region as API.")
+            elif r.status_code == 403:
+                hint = " -> The token works but the app lacks permission to read conversations."
+            raise requests.HTTPError(
+                f"{r.status_code} from {method} {path}: {r.text[:500]}{hint}", response=r
+            )
         return r.json()
     r.raise_for_status()
 
