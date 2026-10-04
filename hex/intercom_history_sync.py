@@ -17,7 +17,8 @@
 #   3. Writeback `conversations_df` -> intercom.conversations_history_stg (overwrite)
 #   4. SQL merge cell (see README.md), using the _history_stg table
 #
-# Secret: INTERCOM_TOKEN (Hex exposes secrets as Python variables).
+# Secret: INTERCOM_TOKEN (Hex exposes secrets as Python variables). The cell raises
+# an error if it can't find it.
 
 import re
 import time
@@ -59,10 +60,25 @@ COLUMNS = [
 _session = requests.Session()
 
 
+def _find_token():
+    """The Intercom token: a Hex secret / variable named INTERCOM_TOKEN (any case), or an
+    environment variable of the same name. Fails loudly instead of silently doing nothing."""
+    import os
+    for name, value in list(globals().items()):
+        if name.upper() == "INTERCOM_TOKEN" and isinstance(value, str) and value.strip():
+            return value.strip()
+    if os.environ.get("INTERCOM_TOKEN", "").strip():
+        return os.environ["INTERCOM_TOKEN"].strip()
+    raise RuntimeError(
+        "No Intercom token found. In Hex: Settings > Secrets > add a secret named "
+        "INTERCOM_TOKEN, then rerun this cell."
+    )
+
+
 def _request(method, path, **kwargs):
     """Call Intercom, backing off on 429 and transient 5xx."""
     headers = {
-        "Authorization": f"Bearer {INTERCOM_TOKEN}",  # noqa: F821 - Hex secret
+        "Authorization": f"Bearer {_TOKEN}",
         "Intercom-Version": INTERCOM_VERSION,
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -204,40 +220,42 @@ def _fmt(unix):
 # ---------------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------------
-if "INTERCOM_TOKEN" in globals():  # Hex injects the secret as a global
-    floor = _day(HISTORY_FROM)
-    # Everything created strictly before `upper` is still to do.
-    upper = _sql_value("history_watermark_df") or _day(HISTORY_UNTIL)
-    start_upper = upper
+_TOKEN = _find_token()
+floor = _day(HISTORY_FROM)
+# Everything created strictly before `upper` is still to do.
+upper = _sql_value("history_watermark_df") or _day(HISTORY_UNTIL)
+start_upper = upper
 
-    found = []
-    while upper > floor and len(found) < MAX_CONVERSATIONS_PER_RUN:
-        lower = max(floor, upper - WINDOW_DAYS * 86400)
-        found += search({
-            "operator": "AND",
-            "value": [
-                {"field": "created_at", "operator": ">", "value": lower - 1},
-                {"field": "created_at", "operator": "<", "value": upper},
-            ],
-        })
-        upper = lower
+print(f"Searching conversations created before {_fmt(upper)}, going back in {WINDOW_DAYS}-day windows...", flush=True)
+found = []
+while upper > floor and len(found) < MAX_CONVERSATIONS_PER_RUN:
+    lower = max(floor, upper - WINDOW_DAYS * 86400)
+    found += search({
+        "operator": "AND",
+        "value": [
+            {"field": "created_at", "operator": ">", "value": lower - 1},
+            {"field": "created_at", "operator": "<", "value": upper},
+        ],
+    })
+    upper = lower
 
-    # Newest-created first. Cut at the cap but keep every conversation sharing the last
-    # created_at second, since the next run resumes with created_at < min(created_at).
-    found.sort(key=lambda x: x[1], reverse=True)
-    seen, batch = set(), []
-    for cid, created, _ in found:
-        if cid in seen:
-            continue
-        if len(batch) >= MAX_CONVERSATIONS_PER_RUN and created != batch[-1][1]:
-            break
-        seen.add(cid)
-        batch.append((cid, created))
+# Newest-created first. Cut at the cap but keep every conversation sharing the last
+# created_at second, since the next run resumes with created_at < min(created_at).
+found.sort(key=lambda x: x[1], reverse=True)
+seen, batch = set(), []
+for cid, created, _ in found:
+    if cid in seen:
+        continue
+    if len(batch) >= MAX_CONVERSATIONS_PER_RUN and created != batch[-1][1]:
+        break
+    seen.add(cid)
+    batch.append((cid, created))
 
-    conversations_df = fetch_rows([cid for cid, _ in batch], SYNC_SOURCE)
-    done = not batch or (upper <= floor and len(batch) == len(set(c for c, _, _ in found)))
-    reached = _fmt(batch[-1][1]) if batch else _fmt(start_upper)
-    print(
-        f"created before {_fmt(start_upper)} -> back to {reached} | "
-        f"fetched={len(conversations_df)}" + (" | DONE, turn off the schedule" if done else "")
-    )
+print(f"Found {len(found)}. Fetching full threads for {len(batch)}...", flush=True)
+conversations_df = fetch_rows([cid for cid, _ in batch], SYNC_SOURCE)
+done = not batch or (upper <= floor and len(batch) == len(set(c for c, _, _ in found)))
+reached = _fmt(batch[-1][1]) if batch else _fmt(start_upper)
+print(
+    f"created before {_fmt(start_upper)} -> back to {reached} | "
+    f"fetched={len(conversations_df)}" + (" | DONE, turn off the schedule" if done else "")
+)

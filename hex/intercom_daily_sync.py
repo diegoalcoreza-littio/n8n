@@ -16,7 +16,8 @@
 #   3. Writeback `conversations_df` -> intercom.conversations_stg (overwrite)
 #   4. SQL merge cell (see README.md)
 #
-# Secret: INTERCOM_TOKEN (Hex exposes secrets as Python variables).
+# Secret: INTERCOM_TOKEN (Hex exposes secrets as Python variables). The cell raises
+# an error if it can't find it.
 
 import re
 import time
@@ -61,10 +62,25 @@ COLUMNS = [
 _session = requests.Session()
 
 
+def _find_token():
+    """The Intercom token: a Hex secret / variable named INTERCOM_TOKEN (any case), or an
+    environment variable of the same name. Fails loudly instead of silently doing nothing."""
+    import os
+    for name, value in list(globals().items()):
+        if name.upper() == "INTERCOM_TOKEN" and isinstance(value, str) and value.strip():
+            return value.strip()
+    if os.environ.get("INTERCOM_TOKEN", "").strip():
+        return os.environ["INTERCOM_TOKEN"].strip()
+    raise RuntimeError(
+        "No Intercom token found. In Hex: Settings > Secrets > add a secret named "
+        "INTERCOM_TOKEN, then rerun this cell."
+    )
+
+
 def _request(method, path, **kwargs):
     """Call Intercom, backing off on 429 and transient 5xx."""
     headers = {
-        "Authorization": f"Bearer {INTERCOM_TOKEN}",  # noqa: F821 - Hex secret
+        "Authorization": f"Bearer {_TOKEN}",
         "Intercom-Version": INTERCOM_VERSION,
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -206,17 +222,19 @@ def _fmt(unix):
 # ---------------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------------
-if "INTERCOM_TOKEN" in globals():  # Hex injects the secret as a global
-    wm = _sql_value("watermark_df")
-    since = wm - OVERLAP_SECONDS if wm is not None else _day(BACKFILL_SINCE)
+_TOKEN = _find_token()
+wm = _sql_value("watermark_df")
+since = wm - OVERLAP_SECONDS if wm is not None else _day(BACKFILL_SINCE)
 
-    found = search({"field": "updated_at", "operator": ">", "value": since})
-    # Oldest-updated first, so a capped run leaves a clean watermark for the next one.
-    found.sort(key=lambda x: x[2])
-    ids = list(dict.fromkeys(cid for cid, _, _ in found))
+print(f"Searching conversations updated after {_fmt(since)}...", flush=True)
+found = search({"field": "updated_at", "operator": ">", "value": since})
+# Oldest-updated first, so a capped run leaves a clean watermark for the next one.
+found.sort(key=lambda x: x[2])
+ids = list(dict.fromkeys(cid for cid, _, _ in found))
 
-    conversations_df = fetch_rows(ids[:MAX_CONVERSATIONS_PER_RUN], SYNC_SOURCE)
-    print(
-        f"since={_fmt(since)} | updated={len(ids)} | fetched={len(conversations_df)} | "
-        f"remaining={max(0, len(ids) - MAX_CONVERSATIONS_PER_RUN)}"
-    )
+print(f"Found {len(ids)}. Fetching full threads for {min(len(ids), MAX_CONVERSATIONS_PER_RUN)}...", flush=True)
+conversations_df = fetch_rows(ids[:MAX_CONVERSATIONS_PER_RUN], SYNC_SOURCE)
+print(
+    f"since={_fmt(since)} | updated={len(ids)} | fetched={len(conversations_df)} | "
+    f"remaining={max(0, len(ids) - MAX_CONVERSATIONS_PER_RUN)}"
+)
