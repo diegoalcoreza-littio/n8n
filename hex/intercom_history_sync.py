@@ -48,6 +48,9 @@ WINDOW_DAYS = 30
 API = "https://api.intercom.io"
 INTERCOM_VERSION = "2.16"
 WORKERS = 8
+FETCH_CHUNK = 250
+# Each run stops fetching after this long and saves what it has; the next run resumes.
+TIME_BUDGET_MINUTES = 40
 # Redshift VARCHAR tops out at 65535 bytes; keep headroom for multi-byte characters.
 MAX_TEXT_CHARS = 20000
 
@@ -113,11 +116,14 @@ def _request(method, path, **kwargs):
 def search(query):
     """Return [(id, created_at, updated_at)] for every conversation matching query."""
     body = {"query": query, "pagination": {"per_page": 150}}
-    found = []
+    found, pages = [], 0
     while True:
         page = _request("POST", "/conversations/search", json=body)
+        pages += 1
         for c in page.get("conversations", []):
             found.append((str(c["id"]), int(c.get("created_at") or 0), int(c.get("updated_at") or 0)))
+        if pages % 10 == 0:
+            print(f"    ...{len(found)} listed so far", flush=True)
         nxt = (page.get("pages") or {}).get("next") or {}
         if not nxt.get("starting_after"):
             return found
@@ -201,15 +207,45 @@ def build_row(c, sync_source):
     }
 
 
-def fetch_rows(ids, sync_source):
+def fetch_rows(items, sync_source, deadline):
+    """Fetch full threads for [(id, sort_key)] in the given order, in chunks.
+
+    Stops after the deadline, but only between two different sort_key seconds: a group
+    of conversations sharing a second is always fetched whole, and the first chunk is
+    always fetched. So the result is a leading slice that ends on a second boundary,
+    every run makes progress, and the next run's watermark can't skip anything."""
     def one(conv_id):
         c = _request("GET", f"/conversations/{conv_id}", params={"display_as": "plaintext"})
         return build_row(c, sync_source)
 
+    rows, t0, i = [], time.time(), 0
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        rows = list(pool.map(one, ids))
+        while i < len(items):
+            j = min(len(items), i + FETCH_CHUNK)
+            if rows and time.time() > deadline:
+                # Finish only the second we're in the middle of, then stop.
+                j = i
+                while j < len(items) and items[j][1] == items[i - 1][1]:
+                    j += 1
+                if j == i:
+                    print(f"    time limit reached, stopping at {len(rows)}/{len(items)}", flush=True)
+                    break
+            rows += list(pool.map(one, [cid for cid, _ in items[i:j]]))
+            i = j
+            rate = len(rows) / max(1e-6, time.time() - t0)
+            print(f"    fetched {len(rows)}/{len(items)} ({rate:.1f}/s)", flush=True)
     # Explicit columns so an empty run still gives the writeback a valid schema.
     return pd.DataFrame(rows, columns=COLUMNS)
+
+
+def take_whole_seconds(items, cap):
+    """First `cap` of [(id, sort_key)], extended so the last second isn't split."""
+    if len(items) <= cap:
+        return items
+    j = cap
+    while j < len(items) and items[j][1] == items[cap - 1][1]:
+        j += 1
+    return items[:j]
 
 
 def _sql_value(name):
@@ -233,6 +269,7 @@ def _fmt(unix):
 # Run
 # ---------------------------------------------------------------------------------
 _TOKEN = _find_token()
+deadline = time.time() + TIME_BUDGET_MINUTES * 60
 floor = _day(HISTORY_FROM)
 # Everything created strictly before `upper` is still to do.
 upper = _sql_value("history_watermark_df") or _day(HISTORY_UNTIL)
@@ -251,22 +288,16 @@ while upper > floor and len(found) < MAX_CONVERSATIONS_PER_RUN:
     })
     upper = lower
 
-# Newest-created first. Cut at the cap but keep every conversation sharing the last
-# created_at second, since the next run resumes with created_at < min(created_at).
-found.sort(key=lambda x: x[1], reverse=True)
-seen, batch = set(), []
-for cid, created, _ in found:
-    if cid in seen:
-        continue
-    if len(batch) >= MAX_CONVERSATIONS_PER_RUN and created != batch[-1][1]:
-        break
-    seen.add(cid)
-    batch.append((cid, created))
+# Newest-created first; next run resumes with created_at < the oldest written, so the
+# cap and the time limit both only cut between whole seconds.
+items = list({cid: (cid, created) for cid, created, _ in found}.values())
+items.sort(key=lambda x: (-x[1], x[0]))
+batch = take_whole_seconds(items, MAX_CONVERSATIONS_PER_RUN)
 
-print(f"Found {len(found)}. Fetching full threads for {len(batch)}...", flush=True)
-conversations_df = fetch_rows([cid for cid, _ in batch], SYNC_SOURCE)
-done = not batch or (upper <= floor and len(batch) == len(set(c for c, _, _ in found)))
-reached = _fmt(batch[-1][1]) if batch else _fmt(start_upper)
+print(f"Found {len(items)}. Fetching full threads for {len(batch)}...", flush=True)
+conversations_df = fetch_rows(batch, SYNC_SOURCE, deadline)
+done = upper <= floor and len(conversations_df) == len(items)
+reached = _fmt(int(conversations_df["created_at_unix"].min())) if len(conversations_df) else _fmt(start_upper)
 print(
     f"created before {_fmt(start_upper)} -> back to {reached} | "
     f"fetched={len(conversations_df)}" + (" | DONE, turn off the schedule" if done else "")

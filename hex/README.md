@@ -13,7 +13,7 @@ Each job uses only its own rows (`sync_source`) to decide where to continue, so 
 
 ## Setup (both projects)
 
-Secret: `INTERCOM_TOKEN`, the same token as the n8n credential "intercom conversations".
+Token: a Hex secret named `INTERCOM_TOKEN`. If you can't create secrets, put `INTERCOM_TOKEN = "..."` in its **own Python cell above the script**, so pasting a new version of the script doesn't wipe it. Never commit the token to this repo.
 
 | Cell | Daily project | History project |
 |---|---|---|
@@ -38,8 +38,10 @@ After that the table exists, and both projects work with all four cells.
 
 ## Getting through the first load
 
-- **Daily:** each run fetches up to 5,000 (about 8-9 min) and prints `remaining=`. Run it hourly until `remaining=0`, then switch to daily.
-- **History:** each run fetches up to 10,000 (about 17 min). About 500k conversations means roughly 50 hourly runs, so about 2 days. Turn the schedule off when it prints `DONE`.
+- Every run stops by itself after **40 minutes** (`TIME_BUDGET_MINUTES`) or at its cap, keeps what it fetched, and the next run continues. It only ever stops between whole seconds, so nothing is skipped, even after a bulk update of thousands of conversations.
+- Progress is printed every 10 search pages and every 250 conversations fetched, with the rate per second.
+- **Daily:** up to 5,000 per run. Run it hourly until it prints `caught up to today`, then switch to daily. It leaves out the last 10 minutes (Intercom's search index lags slightly) and picks them up next run.
+- **History:** up to 10,000 per run. About 500k conversations means roughly 50 hourly runs, so about 2 days. Turn the schedule off when it prints `DONE`.
 
 ## Notes
 

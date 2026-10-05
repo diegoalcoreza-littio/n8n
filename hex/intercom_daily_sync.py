@@ -38,9 +38,13 @@ BACKFILL_SINCE = "2026-01-01"
 # (or schedule it hourly) - after that, one run a day keeps up easily.
 MAX_CONVERSATIONS_PER_RUN = 5000
 
-# updated_at has 1s resolution; re-read a small window so rows sharing the boundary
-# second are not skipped. The merge dedupes by id.
-OVERLAP_SECONDS = 300
+# Leave out the last few minutes: Intercom's search index can lag slightly behind, and a
+# conversation updated just before the run but not yet searchable would otherwise be
+# behind the watermark next time. The next run picks these minutes up.
+SETTLE_SECONDS = 600
+
+# Search in windows of this many days, oldest first, and stop once a run has enough.
+WINDOW_DAYS = 7
 
 # ---------------------------------------------------------------------------------
 # Shared with intercom_history_sync.py - keep both copies identical.
@@ -50,6 +54,9 @@ OVERLAP_SECONDS = 300
 API = "https://api.intercom.io"
 INTERCOM_VERSION = "2.16"
 WORKERS = 8
+FETCH_CHUNK = 250
+# Each run stops fetching after this long and saves what it has; the next run resumes.
+TIME_BUDGET_MINUTES = 40
 # Redshift VARCHAR tops out at 65535 bytes; keep headroom for multi-byte characters.
 MAX_TEXT_CHARS = 20000
 
@@ -115,11 +122,14 @@ def _request(method, path, **kwargs):
 def search(query):
     """Return [(id, created_at, updated_at)] for every conversation matching query."""
     body = {"query": query, "pagination": {"per_page": 150}}
-    found = []
+    found, pages = [], 0
     while True:
         page = _request("POST", "/conversations/search", json=body)
+        pages += 1
         for c in page.get("conversations", []):
             found.append((str(c["id"]), int(c.get("created_at") or 0), int(c.get("updated_at") or 0)))
+        if pages % 10 == 0:
+            print(f"    ...{len(found)} listed so far", flush=True)
         nxt = (page.get("pages") or {}).get("next") or {}
         if not nxt.get("starting_after"):
             return found
@@ -203,15 +213,45 @@ def build_row(c, sync_source):
     }
 
 
-def fetch_rows(ids, sync_source):
+def fetch_rows(items, sync_source, deadline):
+    """Fetch full threads for [(id, sort_key)] in the given order, in chunks.
+
+    Stops after the deadline, but only between two different sort_key seconds: a group
+    of conversations sharing a second is always fetched whole, and the first chunk is
+    always fetched. So the result is a leading slice that ends on a second boundary,
+    every run makes progress, and the next run's watermark can't skip anything."""
     def one(conv_id):
         c = _request("GET", f"/conversations/{conv_id}", params={"display_as": "plaintext"})
         return build_row(c, sync_source)
 
+    rows, t0, i = [], time.time(), 0
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        rows = list(pool.map(one, ids))
+        while i < len(items):
+            j = min(len(items), i + FETCH_CHUNK)
+            if rows and time.time() > deadline:
+                # Finish only the second we're in the middle of, then stop.
+                j = i
+                while j < len(items) and items[j][1] == items[i - 1][1]:
+                    j += 1
+                if j == i:
+                    print(f"    time limit reached, stopping at {len(rows)}/{len(items)}", flush=True)
+                    break
+            rows += list(pool.map(one, [cid for cid, _ in items[i:j]]))
+            i = j
+            rate = len(rows) / max(1e-6, time.time() - t0)
+            print(f"    fetched {len(rows)}/{len(items)} ({rate:.1f}/s)", flush=True)
     # Explicit columns so an empty run still gives the writeback a valid schema.
     return pd.DataFrame(rows, columns=COLUMNS)
+
+
+def take_whole_seconds(items, cap):
+    """First `cap` of [(id, sort_key)], extended so the last second isn't split."""
+    if len(items) <= cap:
+        return items
+    j = cap
+    while j < len(items) and items[j][1] == items[cap - 1][1]:
+        j += 1
+    return items[:j]
 
 
 def _sql_value(name):
@@ -235,18 +275,43 @@ def _fmt(unix):
 # Run
 # ---------------------------------------------------------------------------------
 _TOKEN = _find_token()
+deadline = time.time() + TIME_BUDGET_MINUTES * 60
+
+# Quick token check before the long run: fails in 1 second with a clear message.
+me = _request("GET", "/me")
+print(f"Token OK - Intercom app: {(me.get('app') or {}).get('name', '?')}", flush=True)
+
+# Everything updated at or before `since` is already in the table. Runs only ever stop
+# between whole seconds, so a strict "> since" can't miss anything.
 wm = _sql_value("watermark_df")
-since = wm - OVERLAP_SECONDS if wm is not None else _day(BACKFILL_SINCE)
+since = wm if wm is not None else _day(BACKFILL_SINCE) - 1
+until = int(time.time()) - SETTLE_SECONDS
 
-print(f"Searching conversations updated after {_fmt(since)}...", flush=True)
-found = search({"field": "updated_at", "operator": ">", "value": since})
+found, lo = [], since
+while lo < until and len(found) < MAX_CONVERSATIONS_PER_RUN:
+    hi = min(until, lo + WINDOW_DAYS * 86400)
+    print(f"Searching conversations updated {_fmt(lo)} -> {_fmt(hi)}...", flush=True)
+    window = search({
+        "operator": "AND",
+        "value": [
+            {"field": "updated_at", "operator": ">", "value": lo},
+            {"field": "updated_at", "operator": "<", "value": hi + 1},
+        ],
+    })
+    print(f"    {len(window)} in this window", flush=True)
+    found += window
+    lo = hi
+
 # Oldest-updated first, so a capped run leaves a clean watermark for the next one.
-found.sort(key=lambda x: x[2])
-ids = list(dict.fromkeys(cid for cid, _, _ in found))
+items = list({cid: (cid, upd) for cid, _, upd in found}.values())
+items.sort(key=lambda x: (x[1], x[0]))
+batch = take_whole_seconds(items, MAX_CONVERSATIONS_PER_RUN)
 
-print(f"Found {len(ids)}. Fetching full threads for {min(len(ids), MAX_CONVERSATIONS_PER_RUN)}...", flush=True)
-conversations_df = fetch_rows(ids[:MAX_CONVERSATIONS_PER_RUN], SYNC_SOURCE)
+print(f"Fetching full threads for {len(batch)}...", flush=True)
+conversations_df = fetch_rows(batch, SYNC_SOURCE, deadline)
+caught_up = lo >= until and len(conversations_df) == len(items)
+reached = _fmt(int(conversations_df["updated_at_unix"].max())) if len(conversations_df) else _fmt(since)
 print(
-    f"since={_fmt(since)} | updated={len(ids)} | fetched={len(conversations_df)} | "
-    f"remaining={max(0, len(ids) - MAX_CONVERSATIONS_PER_RUN)}"
+    f"DONE THIS RUN: fetched={len(conversations_df)} | up to {reached} | "
+    + ("caught up to today" if caught_up else "more remaining - run again")
 )
