@@ -34,8 +34,8 @@ SYNC_SOURCE = "daily"
 BACKFILL_SINCE = "2026-01-01"
 
 # Cap per run so the initial load of the year fits in a Hex run (~10 conversations/s,
-# 5000 is about 8-9 minutes). Until `remaining=` hits 0, run the project again by hand
-# (or schedule it hourly) - after that, one run a day keeps up easily.
+# 5000 is about 8-9 minutes). Until it prints "caught up to today", run the project
+# again by hand (or schedule it hourly) - after that, one run a day keeps up easily.
 MAX_CONVERSATIONS_PER_RUN = 5000
 
 # Leave out the last few minutes: Intercom's search index can lag slightly behind, and a
