@@ -33,10 +33,10 @@ SYNC_SOURCE = "daily"
 # First run only: start of the window. Later runs continue from the watermark.
 BACKFILL_SINCE = "2026-01-01"
 
-# Cap per run so the initial load of the year fits in a Hex run (~10 conversations/s,
-# 5000 is about 8-9 minutes). Until it prints "caught up to today", run the project
-# again by hand (or schedule it hourly) - after that, one run a day keeps up easily.
-MAX_CONVERSATIONS_PER_RUN = 5000
+# Cap per run so the initial load of the year fits in a Hex run (measured ~22
+# conversations/s in Hex, so 25000 is about 18-19 minutes). Until it prints "caught up
+# to today", run the project again by hand (or hourly) - after that, daily keeps up.
+MAX_CONVERSATIONS_PER_RUN = 25000
 
 # Leave out the last few minutes: Intercom's search index can lag slightly behind, and a
 # conversation updated just before the run but not yet searchable would otherwise be

@@ -3,8 +3,8 @@
 # One-off backfill of all conversations created before HISTORY_UNTIL, walking backwards
 # in created_at windows. Each run fetches up to MAX_CONVERSATIONS_PER_RUN and the next
 # run continues from the oldest conversation already written, so schedule it hourly and
-# turn the schedule off once it prints DONE. ~500k conversations at ~10/s is roughly 14h
-# of fetching, so about 50 runs.
+# turn the schedule off once it prints DONE. ~500k conversations at ~22/s is roughly 6h
+# of fetching, so about 13 runs.
 #
 # Writes to the same intercom.conversations table as intercom_daily_sync.py, tagged
 # sync_source = 'history' so the two watermarks don't interfere. A conversation created
@@ -36,8 +36,8 @@ HISTORY_UNTIL = "2026-01-01"
 # Safely before the workspace existed. Empty windows cost one API call each.
 HISTORY_FROM = "2015-01-01"
 
-# ~10 conversations/s -> 10000 is about 17 minutes per run.
-MAX_CONVERSATIONS_PER_RUN = 10000
+# Measured ~22 conversations/s in Hex -> 40000 is about 30 minutes per run.
+MAX_CONVERSATIONS_PER_RUN = 40000
 WINDOW_DAYS = 30
 
 # ---------------------------------------------------------------------------------

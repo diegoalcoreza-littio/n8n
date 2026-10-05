@@ -40,8 +40,8 @@ After that the table exists, and both projects work with all four cells.
 
 - Every run stops by itself after **40 minutes** (`TIME_BUDGET_MINUTES`) or at its cap, keeps what it fetched, and the next run continues. It only ever stops between whole seconds, so nothing is skipped, even after a bulk update of thousands of conversations.
 - Progress is printed every 10 search pages and every 250 conversations fetched, with the rate per second.
-- **Daily:** up to 5,000 per run. Run it hourly until it prints `caught up to today`, then switch to daily. It leaves out the last 10 minutes (Intercom's search index lags slightly) and picks them up next run.
-- **History:** up to 10,000 per run. About 500k conversations means roughly 50 hourly runs, so about 2 days. Turn the schedule off when it prints `DONE`.
+- **Daily:** up to 25,000 per run (measured ~22 conversations/s, so about 19 min). Run it hourly until it prints `caught up to today`, then switch to daily. It leaves out the last 10 minutes (Intercom's search index lags slightly) and picks them up next run.
+- **History:** up to 40,000 per run (about 30 min). About 500k conversations means roughly 13 hourly runs. Turn the schedule off when it prints `DONE`.
 
 ## Notes
 
